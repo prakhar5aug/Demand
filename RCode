@@ -1,0 +1,157 @@
+library(DBI)
+library(RMySQL)
+library(googlesheets)
+library(lubridate)
+library(reshape2)
+
+products <- dbConnect(MySQL(),
+                 user = 'prakhar',
+                 password = 'bijnor@123',
+                 host = 'tango.ci9kqv9mlekc.ap-south-1.rds.amazonaws.com',
+                 dbname = 'products')
+
+
+users <- dbConnect(MySQL(),
+                      user = 'prakhar',
+                      password = 'bijnor@123',
+                      host = 'tango.ci9kqv9mlekc.ap-south-1.rds.amazonaws.com',
+                      dbname = 'crofarmUsers')
+
+tdy <- as.numeric(strftime(today(),format = '%y%m%d'))
+ntdy <- as.numeric(strftime(today()-14, format = '%y%m%d'))
+
+q1 <- dbSendQuery(products,paste("SELECT odr.`id`, odr.`retailer_id`, odr.`n_slot_id`, odr.`status`, odrdata.`prod_id`, odrdata.`prod_name`, odrdata.`subcat`, odrdata.`price`,
+ odrdata.`quantity`, odrdata.`transit_quantity`, odrdata.`delivered_quantity`, odr.`po_id`
+                  FROM `products`.`cr_order` odr INNER JOIN `products`.`cr_order_data` odrdata ON odr.`id` = odrdata.`order_id`
+                  WHERE odr.`n_slot_id`> '",ntdy,"' AND odr.`n_slot_id`<= '",tdy,"'",sep=""))
+
+data <- dbFetch(q1,n=-1)
+
+st_data <- data[data$po_id!=0,]
+st_data <- st_data[st_data$n_slot_id==tdy,]
+st_data <- st_data[,c(5,10)]
+st_data <- st_data[st_data$transit_quantity!=0,]
+str_data <- aggregate(st_data$transit_quantity,list(st_data$prod_id), FUN = sum)
+colnames(str_data) <- colnames(st_data)
+
+odr_data <- data[data$po_id==0,]
+odr_data <- odr_data[odr_data$status!="X",]
+
+
+q2 <- dbSendQuery(users, "SELECT rt.`id`, rt.`name`, rt.`shop_name`, ba.`name`, rt.`client_type`
+                  FROM `cr_retailer` rt INNER JOIN `cr_business_associate` ba ON rt.`business_associate_id` = ba.`id`")
+
+Retailer <- dbFetch(q2,n=-1)
+odr_data <- merge(odr_data,Retailer,by.x=2, by.y=1)
+odr_data <- odr_data[odr_data$client_type=="G",]
+odr_data <- odr_data[order(odr_data$n_slot_id),]
+
+q3 <- dbSendQuery(products, "SELECT catl.`id`, catl.`name`, shlf.`shelf_life`
+                  FROM `Product` catl INNER JOIN `distributor_product_mapping` shlf ON catl.`id` = shlf.`product_id`
+                  WHERE shlf.`distributor_id` = 6")
+
+catalogue <- dbFetch(q3,n=-1)
+
+q4 <- dbSendQuery(products,paste("SELECT inv.`distributor_id`, inv.`prod_id`, inv.`quant`, inv.`sell_quant`
+                  FROM `inventory_status` inv
+                  WHERE inv.`slot_id` = ' ",tdy,"'",sep=""))
+
+stock <- dbFetch(q4,n=-1)
+tstock <- melt(stock, id.vars = 1:2)
+tstock <- dcast(tstock, prod_id ~ distributor_id + variable)
+tstock$Inv <- rowSums(tstock[,-1])
+tstock <- tstock[,c(1,6)]
+tstock <- merge(tstock,str_data,by="prod_id",all.x = T)
+tstock[is.na(tstock)] <- 0
+tstock$Inventory <- tstock$Inv - tstock$transit_quantity
+fstock <- tstock[,c(1,4)]
+
+
+demand <- matrix(1,nrow=nrow(catalogue),ncol = 14)
+range <- as.character(unique(odr_data$n_slot_id,1))
+colnames(demand) <- range
+rownames(demand) <- as.character(union(catalogue$id,1))
+
+avgd <- matrix(1,nrow=nrow(catalogue),ncol = 7)
+colnames(avgd) <- range[8:14]
+rownames(avgd) <- as.character(union(catalogue$id,1))
+
+slope <- matrix(1,nrow=nrow(catalogue),ncol = 7)
+colnames(slope) <- range[8:14]
+rownames(slope) <- as.character(union(catalogue$id,1))
+
+for(i in range){
+  sbst <- odr_data[odr_data$n_slot_id==i,]
+  for(j in catalogue$id){
+    demand[as.character(j),i] <- sum(sbst[sbst$prod_id==j,"quantity"])
+  }
+}
+
+ctr <- 1
+for(i in range[8:14]){
+  for(j in catalogue$id){
+    avgd[as.character(j),i] <- round(mean(demand[as.character(j),ctr:(ctr+6)]),digits = 2)
+  }
+  ctr <- ctr+1
+}
+
+averaged <- as.data.frame(avgd)
+averaged$avg <- apply(avgd,1,mean)
+averaged$id <- rownames(averaged)
+
+for(i in range[8:14]){
+  for(j in catalogue$id){
+    slope[as.character(j),i] <- avgd[as.character(j),i] - averaged[as.character(j),"avg"]
+  }
+}
+
+ctr <- -3
+for(i in range[8:14]){
+  slope[,i] <- slope[,i]*ctr
+  ctr <- ctr+1
+}
+
+averaged$slope <- apply(slope,1,sum)/28
+averaged$sd <- apply(avgd,1,sd)
+
+
+
+
+
+
+averaged$TdyDemand <- demand[,14]
+fnl <- merge(catalogue,averaged,by.x=1,by.y=8)
+fnl <- merge(fnl,fstock,by.x=1,by.y=1)
+fnl$effecInv <- fnl$Inventory - fnl$TdyDemand
+fnl[fnl$effecInv<=0,"effecInv"] <- 0
+fnl$TomPred <- round((fnl[,10])/5)*5
+
+fnl$Demand <- NA
+rownames(fnl) <- fnl$id
+fnl <- fnl[!is.na(fnl$effecInv),]
+for (i in fnl$id) {
+  if (fnl[as.character(i),14] > fnl[as.character(i),13]){
+  if (fnl[as.character(i),3]==0) {
+    fnl[as.character(i),15] <- fnl[as.character(i),14] - fnl[as.character(i),13]
+  }
+  else if (fnl[as.character(i),3]==1){
+    fnl[as.character(i),15] <- fnl[as.character(i),14]*1.25 - fnl[as.character(i),13]
+  }
+  else {
+    fnl[as.character(i),15] <- fnl[as.character(i),14]*1.5 - fnl[as.character(i),13]
+  }
+ }
+}
+
+
+fnl <- fnl[order(-fnl[,14]),]
+
+prediction <- 'prediction.csv'
+write.csv(fnl, file= prediction, row.names = F)
+ss <- gs_upload(prediction, sheet_title = "Prediction", overwrite = T)
+
+
+allcon <- dbListConnections(MySQL())
+for(con in allcon){
+  dbDisconnect(con)
+}
